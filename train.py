@@ -1,0 +1,354 @@
+"""
+train.py -- AGENT-OWNED FILE. This is the baseline. Researcher agents may
+rewrite ANYTHING in this file (architecture, optimizer, schedule, batch
+composition, tricks) in pursuit of lower val_bpb.
+
+CONTRACT (must be preserved no matter what changes above it):
+  1. This file must remain runnable as `python train.py` (uses prepare.py's
+     TIME_BUDGET / get_batch / evaluate_bpb -- prepare.py itself is immutable
+     and is the sole source of truth for the metric).
+  2. At the very end of a run, print EXACTLY ONE line of the form:
+         RESULT {"val_bpb": <float>, "train_steps": <int>, "train_seconds": <float>,
+                 "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>}
+     as valid single-line JSON prefixed with "RESULT ". Nothing else may be
+     printed after this line. The harness parses this line to score the epoch.
+  3. val_bpb MUST come from calling prepare.evaluate_bpb(model, ...) -- do not
+     hand-roll a different evaluation path or peek at test.bin.
+  4. Must run on CPU too (slowly) so `--smoke` works without a GPU (CI uses
+     CPU-only torch).
+  5. No new third-party dependencies beyond torch/numpy (+ whatever prepare.py
+     already imports). Keep it a single file.
+
+Baseline architecture is a small nanoGPT-style decoder-only transformer
+trained directly on bytes (vocab_size=256), derived from nanoGPT (MIT
+license) patterns -- CausalSelfAttention via F.scaled_dot_product_attention,
+GELU MLP, pre-norm residual blocks, tied input/output embeddings, AdamW with
+cosine LR decay and linear warmup.
+"""
+
+import argparse
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import prepare
+
+
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class GPTConfig:
+    n_layer: int = 6
+    n_head: int = 6
+    n_embd: int = 384
+    seq_len: int = 512
+    dropout: float = 0.0
+    vocab_size: int = 256
+    bias: bool = False
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.n_embd = cfg.n_embd
+        self.dropout = cfg.dropout
+
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        self.attn_dropout_p = cfg.dropout
+        self.resid_dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(cfg.n_embd, elementwise_affine=True)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln_2 = nn.LayerNorm(cfg.n_embd, elementwise_affine=True)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
+                wpe=nn.Embedding(cfg.seq_len, cfg.n_embd),
+                drop=nn.Dropout(cfg.dropout),
+                h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
+                ln_f=nn.LayerNorm(cfg.n_embd, elementwise_affine=True),
+            )
+        )
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        # weight tying
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+        # scaled init for residual projections, per GPT-2 / nanoGPT convention
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def num_params(self) -> int:
+        n = sum(p.numel() for p in self.parameters())
+        n -= self.transformer.wpe.weight.numel()  # nanoGPT convention: exclude pos emb
+        return n
+
+    def forward(self, idx, targets=None):
+        B, T = idx.size()
+        assert T <= self.cfg.seq_len, f"sequence length {T} exceeds block size {self.cfg.seq_len}"
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), reduction="mean"
+            )
+        return logits, loss
+
+    def configure_optimizer(self, weight_decay, lr, betas):
+        decay, no_decay = [], []
+        for _, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() >= 2:
+                decay.append(p)
+            else:
+                no_decay.append(p)
+        groups = [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        return torch.optim.AdamW(groups, lr=lr, betas=betas)
+
+
+# --------------------------------------------------------------------------
+# LR schedule: linear warmup then cosine decay
+# --------------------------------------------------------------------------
+
+
+def lr_at_step(step, warmup_steps, total_steps_estimate, max_lr, min_lr_ratio=0.1):
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    if total_steps_estimate <= warmup_steps:
+        return max_lr
+    progress = (step - warmup_steps) / max(1, (total_steps_estimate - warmup_steps))
+    progress = min(progress, 1.0)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    min_lr = max_lr * min_lr_ratio
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def train(args):
+    device = get_device()
+    torch.manual_seed(1337)
+
+    smoke = args.smoke
+    if smoke:
+        n_layer, n_embd, n_head = 2, 64, 2
+        seq_len = 64
+        batch_size = 8
+        time_budget = 20.0
+        eval_max_batches = 4
+        eval_batch_size = 8
+    else:
+        n_layer, n_embd, n_head = 6, 384, 6
+        seq_len = 512
+        batch_size = 64
+        time_budget = prepare.TIME_BUDGET
+        eval_max_batches = 200
+        eval_batch_size = 32
+
+    cfg = GPTConfig(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        seq_len=seq_len,
+        dropout=0.0,
+        vocab_size=256,
+    )
+
+    # ensure data is present (idempotent; smoke uses the synth path)
+    prepare.prepare(smoke=smoke)
+
+    model = GPT(cfg).to(device)
+    params_m = model.num_params() / 1e6
+
+    use_amp = device == "cuda"
+    amp_dtype = torch.bfloat16
+
+    try:
+        compiled_model = torch.compile(model)
+        run_model = compiled_model
+    except Exception as e:
+        print(f"[train] torch.compile unavailable ({e}); running eager", flush=True)
+        run_model = model
+
+    optimizer = model.configure_optimizer(weight_decay=0.1, lr=6e-4, betas=(0.9, 0.95))
+    max_lr = 6e-4
+    warmup_steps = 100
+    # rough estimate for cosine schedule length; recomputed as we learn tok/s
+    total_steps_estimate = 5000
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    # --- warmup / compile step, excluded from the wall-clock budget ---
+    x, y = prepare.get_batch("train", batch_size, seq_len, device)
+    with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+        _, loss = run_model(x, y)
+    loss.backward()
+    optimizer.zero_grad(set_to_none=True)
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    step = 0
+    tokens_seen = 0
+    t_start = time.time()
+    last_log_t = t_start
+    last_log_tokens = 0
+
+    while True:
+        elapsed = time.time() - t_start
+        if elapsed >= time_budget:
+            break
+
+        lr = lr_at_step(step, warmup_steps, total_steps_estimate, max_lr)
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+
+        x, y = prepare.get_batch("train", batch_size, seq_len, device)
+        with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+            _, loss = run_model(x, y)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        step += 1
+        tokens_seen += batch_size * seq_len
+
+        if step % 50 == 0:
+            now = time.time()
+            dt = now - last_log_t
+            dtok = tokens_seen - last_log_tokens
+            toks_per_sec = dtok / dt if dt > 0 else 0.0
+            print(
+                f"[train] step={step} loss={loss.item():.4f} tok/s={toks_per_sec:.0f} "
+                f"elapsed={elapsed:.1f}s/{time_budget:.0f}s",
+                flush=True,
+            )
+            last_log_t = now
+            last_log_tokens = tokens_seen
+
+    train_seconds = time.time() - t_start
+
+    peak_vram_mb = 0.0
+    if device == "cuda":
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    val_bpb = prepare.evaluate_bpb(
+        model,
+        batch_size=eval_batch_size,
+        max_batches=eval_max_batches,
+        seq_len=seq_len,
+        device=device,
+    )
+
+    result = {
+        "val_bpb": float(val_bpb),
+        "train_steps": int(step),
+        "train_seconds": float(train_seconds),
+        "peak_vram_mb": float(peak_vram_mb),
+        "params_m": float(params_m),
+        "tokens_seen": int(tokens_seen),
+    }
+    print("RESULT " + json.dumps(result))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--smoke", action="store_true", help="tiny config, fast CPU smoke test")
+    args = ap.parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()

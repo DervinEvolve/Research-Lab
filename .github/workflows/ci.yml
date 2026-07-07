@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  pull_request:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (CPU-only torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy requests
+
+      - name: prepare.py smoke (synthetic corpus, no download)
+        run: python prepare.py --smoke
+
+      - name: train.py smoke (tiny model, ~20s CPU training)
+        run: python train.py --smoke | tee /tmp/train_smoke_out.txt
+
+      - name: Assert RESULT line parses with finite val_bpb
+        run: |
+          python -c "
+          import json, math, sys
+          lines = [l for l in open('/tmp/train_smoke_out.txt') if l.startswith('RESULT ')]
+          assert lines, 'no RESULT line found in train.py --smoke output'
+          payload = json.loads(lines[-1][len('RESULT '):])
+          val_bpb = payload['val_bpb']
+          assert isinstance(val_bpb, (int, float)), 'val_bpb is not numeric'
+          assert math.isfinite(val_bpb), f'val_bpb is not finite: {val_bpb}'
+          for key in ('train_steps', 'train_seconds', 'peak_vram_mb', 'params_m', 'tokens_seen'):
+              assert key in payload, f'missing key: {key}'
+          print('RESULT line OK:', payload)
+          "

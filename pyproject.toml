@@ -1,0 +1,14 @@
+[project]
+name = "research-lab"
+version = "0.1.0"
+description = "Autonomous multi-agent research bench: iterate train.py to minimize val_bpb on enwik8 under a fixed compute budget."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "requests",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
