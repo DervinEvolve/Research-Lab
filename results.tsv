@@ -1,1 +1,2 @@
 epoch	commit	val_bpb	train_steps	train_seconds	peak_vram_mb	params_m	status	hypothesis
+1	reverted	6.8969	4174	300.1	3161	10.720	discard	Replacing all LayerNorm layers with RMSNorm will lower val_bpb by at least 0.1 because RMSNorm eliminates mean-centering noise in the residual stream and is empirically known to improve training stability and convergence in small transformers.
