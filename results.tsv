@@ -1,2 +1,3 @@
 epoch	commit	val_bpb	train_steps	train_seconds	peak_vram_mb	params_m	status	hypothesis
 1	reverted	6.8969	4174	300.1	3161	10.720	discard	Replacing all LayerNorm layers with RMSNorm will lower val_bpb by at least 0.1 because RMSNorm eliminates mean-centering noise in the residual stream and is empirically known to improve training stability and convergence in small transformers.
+2	reverted	7.0622	4097	300.1	3161	10.725	discard	Setting total_steps_estimate to a realistic ~4000 (matching actual step count) instead of 5000 will lower val_bpb by >0.05 because the cosine schedule currently never reaches its low-LR tail within the 300s budget, leaving the model over-annealing-starved and stuck at high LR when training ends.
