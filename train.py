@@ -56,6 +56,19 @@ class GPTConfig:
     bias: bool = False
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (without mean subtraction)."""
+    def __init__(self, normalized_shape, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+
+    def forward(self, x):
+        # x: (B, T, C) or (B, C) -- normalized_shape is last dimension.
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -104,9 +117,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(cfg.n_embd, elementwise_affine=True)
+        self.ln_1 = RMSNorm(cfg.n_embd, eps=1e-5)   # replaced LayerNorm
         self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = nn.LayerNorm(cfg.n_embd, elementwise_affine=True)
+        self.ln_2 = RMSNorm(cfg.n_embd, eps=1e-5)   # replaced LayerNorm
         self.mlp = MLP(cfg)
 
     def forward(self, x):
@@ -125,7 +138,7 @@ class GPT(nn.Module):
                 wpe=nn.Embedding(cfg.seq_len, cfg.n_embd),
                 drop=nn.Dropout(cfg.dropout),
                 h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
-                ln_f=nn.LayerNorm(cfg.n_embd, elementwise_affine=True),
+                ln_f=RMSNorm(cfg.n_embd, eps=1e-5),   # replaced LayerNorm
             )
         )
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
@@ -145,6 +158,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)   # RMSNorm weight initialized to 1
 
     def num_params(self) -> int:
         n = sum(p.numel() for p in self.parameters())
