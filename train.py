@@ -1,3 +1,4 @@
+
 """
 train.py -- AGENT-OWNED FILE. This is the baseline. Researcher agents may
 rewrite ANYTHING in this file (architecture, optimizer, schedule, batch
@@ -290,7 +291,7 @@ def train(args):
     optimizer = model.configure_optimizer(weight_decay=0.1, lr=max_lr, betas=(0.9, 0.95))
     warmup_steps = 100
     # rough estimate for cosine schedule length; recomputed as we learn tok/s
-    total_steps_estimate = 5000
+    total_steps_estimate = 4100
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
