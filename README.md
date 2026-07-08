@@ -6,7 +6,7 @@ down validation loss on a real language-modeling benchmark, under a fixed
 compute budget, with a fixed measurement harness they cannot tamper with.
 
 Concretely: `train.py` implements a small nanoGPT-style byte-level
-transformer trained on [enwik8](http://mattmahoney.net/dc/enwik8.zip).
+transformer trained on [TinyStories-GPT4-clean](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean).
 Each epoch, a researcher agent may rewrite anything in `train.py` -- the
 architecture, the optimizer, the schedule, the batching strategy -- and the
 harness measures `val_bpb` (validation bits-per-byte, lower is better)
@@ -18,7 +18,7 @@ multi-agent contract, and `wiki/` for the accumulated findings.
 ## Running locally
 
 ```bash
-# one-time: download enwik8 (~35MB) and materialize train/val/test .bin files
+# one-time: download TinyStories parquet (~673MB) and materialize train/val/test .bin files
 python prepare.py
 
 # train the current baseline for TIME_BUDGET_S seconds (default 300) and
@@ -32,7 +32,7 @@ python train.py --smoke
 
 Environment variables:
 
-- `RESEARCH_CACHE` -- where `prepare.py` stores `enwik8.zip` and the
+- `RESEARCH_CACHE` -- where `prepare.py` stores the dataset parquet and the
   `train.bin` / `val.bin` / `test.bin` memmap files. Defaults to
   `~/.cache/research-lab`.
 - `TIME_BUDGET_S` -- wall-clock training budget in seconds, read by

@@ -1,12 +1,14 @@
 """
 prepare.py -- FIXED HARNESS. Researcher agents must NEVER modify this file.
 
-Byte-level data pipeline for enwik8 (http://mattmahoney.net/dc/enwik8.zip).
-enwik8 is exactly 100,000,000 bytes. We split it:
-    train.bin : first  95,000,000 bytes
-    val.bin   : next    2,500,000 bytes
-    test.bin  : last    2,500,000 bytes
-Vocab is raw bytes (256 tokens) -- no tokenizer training needed.
+Byte-level data pipeline for TinyStories-GPT4-clean
+(https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean):
+2.73M short stories, ~2.19B chars of pure ASCII (74 unique bytes).
+Canonical pre-shuffled splits by row index (per the dataset card):
+    test  : rows      0 -  9,999
+    val   : rows 10,000 - 19,999
+    train : rows 20,000+  (capped at TRAIN_BYTE_CAP bytes)
+Stories are joined with "\n\n". Vocab is raw bytes (256 tokens).
 
 This module also owns:
   - TIME_BUDGET / MAX_SEQ_LEN constants agents can read but not redefine here
@@ -25,20 +27,19 @@ import argparse
 import math
 import os
 import sys
-import zipfile
 from pathlib import Path
 
 import numpy as np
 import torch
 
-ENWIK8_URL = "http://mattmahoney.net/dc/enwik8.zip"
-CACHE_DIR = Path(os.environ.get("RESEARCH_CACHE", "~/.cache/research-lab")).expanduser()
+DATASET_URL = "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main/tinystories_gpt4_clean.parquet"
+# Versioned data dir: switching datasets must never mix with stale bins.
+CACHE_DIR = Path(os.environ.get("RESEARCH_CACHE", "~/.cache/research-lab")).expanduser() / "tinystories_v1"
 
 VOCAB_SIZE = 256
-TRAIN_BYTES = 95_000_000
-VAL_BYTES = 2_500_000
-TEST_BYTES = 2_500_000
-TOTAL_BYTES = TRAIN_BYTES + VAL_BYTES + TEST_BYTES  # 100,000,000
+TEST_ROWS = 10_000       # rows 0..9,999
+VAL_ROWS = 10_000        # rows 10,000..19,999
+TRAIN_BYTE_CAP = 500_000_000  # cap joined train text (plenty for 300s runs)
 
 TIME_BUDGET = float(os.environ.get("TIME_BUDGET_S", 300))
 MAX_SEQ_LEN = 1024
@@ -54,15 +55,17 @@ def _bin_paths(cache_dir: Path):
     }
 
 
-def _download_enwik8(dest_zip: Path):
+def _download_parquet(dest: Path):
     import requests
 
-    print(f"[prepare] downloading {ENWIK8_URL} -> {dest_zip}", file=sys.stderr)
-    with requests.get(ENWIK8_URL, stream=True, timeout=120) as r:
+    print(f"[prepare] downloading {DATASET_URL} -> {dest}", file=sys.stderr)
+    tmp = dest.with_suffix(".part")
+    with requests.get(DATASET_URL, stream=True, timeout=600) as r:
         r.raise_for_status()
-        with open(dest_zip, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 22):
                 f.write(chunk)
+    tmp.rename(dest)
 
 
 def _synth_smoke_bytes(n_bytes: int, seed: int = 0) -> bytes:
@@ -89,26 +92,48 @@ def prepare(cache_dir: Path = CACHE_DIR, smoke: bool = False, force: bool = Fals
         test_n = total - train_n - val_n
         raw = _synth_smoke_bytes(total, seed=0)
     else:
-        zip_path = cache_dir / "enwik8.zip"
-        if not zip_path.exists():
-            _download_enwik8(zip_path)
-        print("[prepare] unzipping enwik8", file=sys.stderr)
-        with zipfile.ZipFile(zip_path) as zf:
-            with zf.open("enwik8") as f:
-                raw = f.read()
-        if len(raw) != TOTAL_BYTES:
-            print(
-                f"[prepare] warning: enwik8 length {len(raw)} != expected {TOTAL_BYTES}",
-                file=sys.stderr,
-            )
-        train_n, val_n, test_n = TRAIN_BYTES, VAL_BYTES, TEST_BYTES
+        import pyarrow.parquet as pq
 
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    splits = {
-        "train": arr[:train_n],
-        "val": arr[train_n : train_n + val_n],
-        "test": arr[train_n + val_n : train_n + val_n + test_n],
-    }
+        pq_path = cache_dir / "tinystories_gpt4_clean.parquet"
+        if not pq_path.exists():
+            _download_parquet(pq_path)
+        print("[prepare] reading parquet + building byte splits", file=sys.stderr)
+        pf = pq.ParquetFile(pq_path)
+        sep = b"\n\n"
+        test_parts, val_parts, train_parts = [], [], []
+        train_bytes = 0
+        row = 0
+        done = False
+        for batch in pf.iter_batches(batch_size=8192, columns=["text"]):
+            for t in batch.column("text").to_pylist():
+                b = t.encode("utf-8", errors="ignore") + sep
+                if row < TEST_ROWS:
+                    test_parts.append(b)
+                elif row < TEST_ROWS + VAL_ROWS:
+                    val_parts.append(b)
+                elif train_bytes < TRAIN_BYTE_CAP:
+                    train_parts.append(b)
+                    train_bytes += len(b)
+                else:
+                    done = True
+                    break
+                row += 1
+            if done:
+                break
+        splits_raw = {
+            "train": b"".join(train_parts),
+            "val": b"".join(val_parts),
+            "test": b"".join(test_parts),
+        }
+        splits = {k: np.frombuffer(v, dtype=np.uint8) for k, v in splits_raw.items()}
+
+    if smoke:
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        splits = {
+            "train": arr[:train_n],
+            "val": arr[train_n : train_n + val_n],
+            "test": arr[train_n + val_n : train_n + val_n + test_n],
+        }
 
     for name, data in splits.items():
         p = paths[name]

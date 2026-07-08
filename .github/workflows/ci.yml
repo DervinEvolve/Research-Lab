@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies (CPU-only torch)
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy requests
+          pip install numpy requests pyarrow
 
       - name: prepare.py smoke (synthetic corpus, no download)
         run: python prepare.py --smoke

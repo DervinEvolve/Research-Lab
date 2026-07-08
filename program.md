@@ -1,4 +1,4 @@
-# Research Program: enwik8 val_bpb under a fixed budget
+# Research Program: TinyStories val_bpb under a fixed budget
 
 This is the operating contract for the autonomous multi-agent research org
 that iterates on `train.py`. It is adapted from the shape of
@@ -10,7 +10,7 @@ patterns.
 
 ## Mission
 
-Drive `val_bpb` (validation bits-per-byte on enwik8) as low as possible,
+Drive `val_bpb` (validation bits-per-byte on TinyStories, byte-level) as low as possible,
 under a **fixed wall-clock training budget** (`TIME_BUDGET`, default 300s)
 on **one GPU**. This is a constrained-compute research loop, not a
 leaderboard chase against unlimited resources: the only lever is making
