@@ -54,6 +54,7 @@ class GPTConfig:
     dropout: float = 0.0
     vocab_size: int = 256
     bias: bool = False
+    mlp_hidden: int = 1024  # SwiGLU hidden dim (parameter-matched to 4x GELU)
 
 
 class RMSNorm(nn.Module):
@@ -103,15 +104,22 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """SwiGLU MLP: gated linear unit with SiLU gate.
+
+    hidden_dim=1024 keeps parameter count roughly matched to the previous
+    4x GELU MLP. GELU 4x: 2 * n_embd * (4*n_embd) = 2*384*1536 = 1,179,648.
+    SwiGLU: 3 * n_embd * hidden = 3*384*1024 = 1,179,648 -- exactly matched.
+    """
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        hidden = cfg.mlp_hidden
+        self.c_fc = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
+        self.c_gate = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
+        self.c_proj = nn.Linear(hidden, cfg.n_embd, bias=cfg.bias)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x):
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        return self.dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 
 class Block(nn.Module):
@@ -242,6 +250,7 @@ def train(args):
         time_budget = 20.0
         eval_max_batches = 4
         eval_batch_size = 8
+        mlp_hidden = 128
     else:
         n_layer, n_embd, n_head = 6, 384, 6
         seq_len = 512
@@ -249,6 +258,7 @@ def train(args):
         time_budget = prepare.TIME_BUDGET
         eval_max_batches = 200
         eval_batch_size = 32
+        mlp_hidden = 1024
 
     cfg = GPTConfig(
         n_layer=n_layer,
@@ -257,6 +267,7 @@ def train(args):
         seq_len=seq_len,
         dropout=0.0,
         vocab_size=256,
+        mlp_hidden=mlp_hidden,
     )
 
     # ensure data is present (idempotent; smoke uses the synth path)
