@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(
+        y = F.scaled_dot_product_attention( 
             q,
             k,
             v,
@@ -180,7 +180,7 @@ class GPT(nn.Module):
                 decay.append(p)
             else:
                 no_decay.append(p)
-        groups = [
+        groups = [ 
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
@@ -260,8 +260,8 @@ def train(args):
         print(f"[train] torch.compile unavailable ({e}); running eager", flush=True)
         run_model = model
 
-    optimizer = model.configure_optimizer(weight_decay=0.1, lr=6e-4, betas=(0.9, 0.95))
-    max_lr = 6e-4
+    max_lr = 1.2e-3
+    optimizer = model.configure_optimizer(weight_decay=0.1, lr=max_lr, betas=(0.9, 0.95))
     warmup_steps = 100
     # rough estimate for cosine schedule length; recomputed as we learn tok/s
     total_steps_estimate = 5000
