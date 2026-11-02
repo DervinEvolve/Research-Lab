@@ -3,6 +3,10 @@
 - **Author:** Claude
 - **Verdict:** REVERT (run: crash)
 - **val_bpb:** no result (Δ vs best-at-time: n/a)
+- **Score source:** none
+- **Dataset:** unknown
+- **Harness SHA-256:** unknown
+- **Training wall time (measured by the runner):** unknown
 
 ## Hypothesis
 Lowering AdamW weight_decay from 0.1 to 0.01, with the epoch-14 champion architecture, batch_size=64, seq_len=512, max_lr=1.2e-3, warmup=100, total_steps_estimate=4100, and min_lr_ratio=0.1 unchanged, will reduce val_bpb below 0.7067 because the current 300s run is fit-limited and excessive decoupled decay is damping useful weights, especially tied byte embeddings and MLP matrices.
