@@ -76,7 +76,9 @@ processes -- an implementation may fuse or split them across models.
   acceptance until resolved or explicitly overridden with reasoning logged.
 - **Reviewer** compares measured `val_bpb` against the current best,
   decides keep-or-revert, and logs the row to `results.tsv` regardless of
-  outcome (reverted epochs are logged too, with `status=reverted`).
+  outcome (reverted epochs are logged too: `commit=reverted`, with
+  `status=discard` for a run that finished and `status=crash` for one that
+  did not).
 - **Commentator** narrates the epoch in plain language and ensures
   `wiki/` is updated to reflect the verdict -- this is how the org
   accumulates institutional memory instead of re-discovering the same dead
@@ -102,5 +104,39 @@ processes -- an implementation may fuse or split them across models.
     keep training after the loop reports it stopped).
 
 Any of the above is an automatic revert to the last known-good `train.py`,
-logged in `results.tsv` with `status=reverted-budget-gaming`, and written up
-in `wiki/failed-approaches.md` so it is never quietly retried.
+logged in `results.tsv` as reverted with the reason in the epoch's finding
+page, and written up in `wiki/failed-approaches.md` so it is never quietly
+retried.
+
+## Runs
+
+Records are kept per run. A finished run moves to `archive/run-N/` (ledger,
+finding pages, final `train.py`, README) and the next run starts with an
+empty ledger and an empty `wiki/findings/`. Scores are never compared across
+runs: each run measures its own baseline on its own runner image.
+
+**Run 1** (7 Jul to 13 Nov 2026) is archived in
+[`archive/run-1/`](./archive/run-1/README.md).
+
+**Run 2 starts from run 1's champion `train.py`** (epoch 14, self-reported
+0.7067 val_bpb on the July runner), with one change: if `torch.compile` fails
+on its first use, training falls back to eager mode with a warning instead of
+crashing, and the `RESULT` line reports `"compiled": true|false`. Reasons:
+
+- Run 1's November crashes came from the runner image, which had no C
+  compiler for `torch.compile`, not from the model code. The image now has
+  one. The original scaffold calls `torch.compile` the same way, so restoring
+  it would not have avoided the crash; the champion keeps what run 1 learned.
+- The image changed, so run 1's numbers do not carry over. Run 2's baseline is
+  the starting `train.py` measured once on the new image before epoch 1.
+- `compiled` makes an eager fallback visible. Eager runs take far fewer steps
+  in the same budget (about 2,400 to 3,700 against about 4,300 compiled in
+  run 1), so a `compiled: false` result is never compared with a compiled one
+  without saying so.
+
+## Syntax check
+
+Before any data is prepared or a GPU is started, the runner compiles
+`train.py` with the same Python that will run it. A file that does not
+compile is recorded as a crash at stage `syntax` and costs no GPU time. Four
+of run 1's epochs (20, 23, 29 and 31) were lost to syntax errors.

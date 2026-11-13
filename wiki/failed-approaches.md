@@ -28,4 +28,6 @@ both directions.
 
 ## Entries
 
-_(none yet -- this program has not run an epoch)_
+_(none yet for run 2. Run 1's reverted and crashed epochs are in
+[`archive/run-1/`](../archive/run-1/README.md): `results-dedup.tsv` has one
+row per epoch and `findings/` has the reasoning.)_

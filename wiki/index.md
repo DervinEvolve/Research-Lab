@@ -12,10 +12,10 @@ read and write markdown as their shared long-term memory across epochs).
   program start and appended to as new ones surface.
 - `failed-approaches.md` -- reverted or negative-result hypotheses, so the
   org does not re-spend an epoch re-discovering the same dead end.
-- `findings/<topic>.md` -- one page per **validated** finding. A finding
-  earns a page when a hypothesis is tested, accepted (or conclusively
-  rejected with a clear negative result worth remembering), and logged to
-  `results.tsv`. Each findings page must contain:
+- `findings/epoch-NNN.md` -- one page per epoch of the current run, written
+  by the lab after the verdict, whatever the outcome. Earlier runs' pages are
+  in `../archive/run-N/findings/`. The lab never overwrites a page written by
+  another experiment. Each findings page contains:
   1. The hypothesis as stated by the Planner.
   2. The result numbers (val_bpb before/after, train_steps, train_seconds,
      peak_vram_mb, params_m).
@@ -34,9 +34,18 @@ read and write markdown as their shared long-term memory across epochs).
   contradiction is flagged (a new dated note appended to that page) rather
   than silently overwritten. Silent overwrites destroy the ability to
   detect noisy/non-reproducible effects.
-- Findings pages are named by topic/mechanism, not by epoch number, e.g.
-  `findings/rmsnorm-vs-layernorm.md`, `findings/batch-size-512.md`.
+- Findings pages are named by epoch number (`findings/epoch-014.md`), so
+  the page and its ledger row share one key. Pages for a topic that spans
+  several epochs may be added by hand alongside them.
 
 ## Current findings
 
-_(none yet -- this program has not run an epoch)_
+_(none yet -- run 2 has not run an epoch)_
+
+## Earlier runs
+
+- [Run 1](../archive/run-1/README.md), 7 Jul to 13 Nov 2026: 49 epochs, 4
+  keeps, best self-reported 0.7067 val_bpb at epoch 14 (never reproduced).
+  Ledger: `archive/run-1/results.tsv` (as written) and
+  `archive/run-1/results-dedup.tsv` (one row per epoch). Pages:
+  `archive/run-1/findings/`.

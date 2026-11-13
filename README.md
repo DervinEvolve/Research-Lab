@@ -15,6 +15,20 @@ on one GPU. `prepare.py` (the data pipeline and the eval metric) is frozen
 infrastructure the agents never touch. See `program.md` for the full
 multi-agent contract, and `wiki/` for the accumulated findings.
 
+## Runs
+
+| Run | Dates | Status | Records |
+|---|---|---|---|
+| 1 | 7 Jul to 13 Nov 2026 | Archived. 49 epochs; best self-reported score 0.7067 val_bpb at epoch 14, never reproduced. | [`archive/run-1/`](./archive/run-1/) |
+| 2 | not started | Starts fresh: an empty `results.tsv` (header only) and an empty `wiki/findings/`. | `results.tsv`, `wiki/` |
+
+Scores from different runs are not comparable. Run 1 spanned three setups
+(enwik8, then TinyStories on the July runner, then a pinned dataset on a new
+runner image where `torch.compile` could not run); its
+[README](./archive/run-1/README.md) explains each, the epoch 20 crash loop that
+wrote 2,326 duplicate ledger rows, and why run 2 starts from run 1's champion
+`train.py` with a fresh baseline measurement.
+
 ## Running locally
 
 ```bash
@@ -56,12 +70,17 @@ Full detail, including the multi-agent org (Planner / Executor / Challenger
 ### The RESULT line
 
 ```
-RESULT {"val_bpb": <float>, "train_steps": <int>, "train_seconds": <float>, "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>}
+RESULT {"val_bpb": <float>, "train_steps": <int>, "train_seconds": <float>, "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>, "compiled": <bool>}
 ```
 
 This is the only machine-readable output the harness (and CI) parses. It
 must be valid JSON on a single line, prefixed with `RESULT `, and nothing
-may be printed to stdout after it.
+may be printed to stdout after it. `compiled` says whether training actually
+ran through `torch.compile` (from run 2 on): an eager-mode run takes far fewer
+steps in the same budget, so the two are not comparable.
+
+Every score is self-reported: the runner parses the line that the generated
+`train.py` prints and does not evaluate the model independently.
 
 ## Layout
 
@@ -69,10 +88,19 @@ may be printed to stdout after it.
 prepare.py            fixed harness: data pipeline + evaluate_bpb (never edited by agents)
 train.py              agent-owned baseline: nanoGPT-style byte-level GPT + training loop
 program.md            the multi-agent research contract
-results.tsv           append-only log of every epoch's measured result
+results.tsv           append-only log of every epoch's result in the current run
 wiki/                 accumulated findings, open questions, failed approaches
+archive/run-N/        a finished run: its ledger, finding pages, final train.py and a README
 .github/workflows/ci.yml   smoke-tests prepare.py + train.py on every PR
 ```
+
+## Starting a later run
+
+Archive the finished run first, so its records are not mixed with the next:
+copy `results.tsv`, `wiki/findings/` and `train.py` into `archive/run-N/`,
+write its README, then reset `results.tsv` to the header line and
+`wiki/findings/` to an empty folder. The lab also refuses to overwrite a
+finding page written by a different experiment.
 
 ## Credit
 

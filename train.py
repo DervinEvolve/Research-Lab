@@ -10,7 +10,8 @@ CONTRACT (must be preserved no matter what changes above it):
      and is the sole source of truth for the metric).
   2. At the very end of a run, print EXACTLY ONE line of the form:
          RESULT {"val_bpb": <float>, "train_steps": <int>, "train_seconds": <float>,
-                 "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>}
+                 "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>,
+                 "compiled": <bool>}
      as valid single-line JSON prefixed with "RESULT ". Nothing else may be
      printed after this line. The harness parses this line to score the epoch.
   3. val_bpb MUST come from calling prepare.evaluate_bpb(model, ...) -- do not
@@ -280,9 +281,16 @@ def train(args):
     use_amp = device == "cuda"
     amp_dtype = torch.bfloat16
 
+    # torch.compile is lazy: torch.compile() itself rarely fails, the real
+    # compile (and any missing-compiler error) happens on the first forward
+    # pass. That pass is the warmup step below, so the fallback lives there.
+    # Whichever mode actually trained is reported as "compiled" in RESULT:
+    # eager runs take far fewer steps and are not comparable to compiled ones.
+    compiled = False
     try:
-        compiled_model = torch.compile(model)
-        run_model = compiled_model
+        run_model = torch.compile(model)
+        # TORCHDYNAMO_DISABLE=1 makes torch.compile a silent no-op.
+        compiled = os.environ.get("TORCHDYNAMO_DISABLE", "") != "1"
     except Exception as e:
         print(f"[train] torch.compile unavailable ({e}); running eager", flush=True)
         run_model = model
@@ -298,12 +306,27 @@ def train(args):
 
     # --- warmup / compile step, excluded from the wall-clock budget ---
     x, y = prepare.get_batch("train", batch_size, seq_len, device)
-    with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
-        _, loss = run_model(x, y)
-    loss.backward()
-    optimizer.zero_grad(set_to_none=True)
-    if device == "cuda":
-        torch.cuda.synchronize()
+
+    def warmup_step(m):
+        with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+            _, warm_loss = m(x, y)
+        warm_loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    try:
+        warmup_step(run_model)
+    except Exception as e:
+        if not compiled:
+            raise
+        print(f"[train] WARNING: torch.compile failed on first use "
+              f"({type(e).__name__}: {str(e)[:300]}); running EAGER, compiled=false", flush=True)
+        torch._dynamo.reset()
+        run_model = model
+        compiled = False
+        optimizer.zero_grad(set_to_none=True)
+        warmup_step(run_model)
 
     step = 0
     tokens_seen = 0
@@ -366,6 +389,7 @@ def train(args):
         "peak_vram_mb": float(peak_vram_mb),
         "params_m": float(params_m),
         "tokens_seen": int(tokens_seen),
+        "compiled": bool(compiled),
     }
     print("RESULT " + json.dumps(result))
 
