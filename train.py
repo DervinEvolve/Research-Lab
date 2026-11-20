@@ -1,30 +1,9 @@
-
 """
-train.py -- AGENT-OWNED FILE. This is the baseline. Researcher agents may
-rewrite ANYTHING in this file (architecture, optimizer, schedule, batch
-composition, tricks) in pursuit of lower val_bpb.
+train.py -- AGENT-OWNED FILE. Baseline small byte-level GPT with Muon for hidden 2D matrices.
 
-CONTRACT (must be preserved no matter what changes above it):
-  1. This file must remain runnable as `python train.py` (uses prepare.py's
-     TIME_BUDGET / get_batch / evaluate_bpb -- prepare.py itself is immutable
-     and is the sole source of truth for the metric).
-  2. At the very end of a run, print EXACTLY ONE line of the form:
-         RESULT {"val_bpb": <float>, "train_steps": <int>, "train_seconds": <float>,
-                 "peak_vram_mb": <float>, "params_m": <float>, "tokens_seen": <int>}
-     as valid single-line JSON prefixed with "RESULT ". Nothing else may be
-     printed after this line. The harness parses this line to score the epoch.
-  3. val_bpb MUST come from calling prepare.evaluate_bpb(model, ...) -- do not
-     hand-roll a different evaluation path or peek at test.bin.
-  4. Must run on CPU too (slowly) so `--smoke` works without a GPU (CI uses
-     CPU-only torch).
-  5. No new third-party dependencies beyond torch/numpy (+ whatever prepare.py
-     already imports). Keep it a single file.
-
-Baseline architecture is a small nanoGPT-style decoder-only transformer
-trained directly on bytes (vocab_size=256), derived from nanoGPT (MIT
-license) patterns -- CausalSelfAttention via F.scaled_dot_product_attention,
-GELU MLP, pre-norm residual blocks, tied input/output embeddings, AdamW with
-cosine LR decay and linear warmup.
+CONTRACT: runnable as `python train.py`; prints exactly one final line
+  RESULT {"val_bpb": ..., "train_steps": ..., "train_seconds": ..., "peak_vram_mb": ..., "params_m": ..., "tokens_seen": ...}
+val_bpb comes from prepare.evaluate_bpb. Runs on CPU too (--smoke). torch/numpy only.
 """
 
 import argparse
@@ -66,7 +45,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(normalized_shape))
 
     def forward(self, x):
-        # x: (B, T, C) or (B, C) -- normalized_shape is last dimension.
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x * rms * self.weight
 
@@ -91,7 +69,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        y = F.scaled_dot_product_attention( 
+        y = F.scaled_dot_product_attention(
             q,
             k,
             v,
@@ -105,12 +83,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """SwiGLU MLP: gated linear unit with SiLU gate.
-
-    hidden_dim=1024 keeps parameter count roughly matched to the previous
-    4x GELU MLP. GELU 4x: 2 * n_embd * (4*n_embd) = 2*384*1536 = 1,179,648.
-    SwiGLU: 3 * n_embd * hidden = 3*384*1024 = 1,179,648 -- exactly matched.
-    """
+    """SwiGLU MLP."""
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         hidden = cfg.mlp_hidden
@@ -126,9 +99,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln_1 = RMSNorm(cfg.n_embd, eps=1e-5)   # replaced LayerNorm
+        self.ln_1 = RMSNorm(cfg.n_embd, eps=1e-5)
         self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = RMSNorm(cfg.n_embd, eps=1e-5)   # replaced LayerNorm
+        self.ln_2 = RMSNorm(cfg.n_embd, eps=1e-5)
         self.mlp = MLP(cfg)
 
     def forward(self, x):
@@ -147,15 +120,13 @@ class GPT(nn.Module):
                 wpe=nn.Embedding(cfg.seq_len, cfg.n_embd),
                 drop=nn.Dropout(cfg.dropout),
                 h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
-                ln_f=RMSNorm(cfg.n_embd, eps=1e-5),   # replaced LayerNorm
+                ln_f=RMSNorm(cfg.n_embd, eps=1e-5),
             )
         )
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        # weight tying
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
-        # scaled init for residual projections, per GPT-2 / nanoGPT convention
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
@@ -168,11 +139,11 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, RMSNorm):
-            nn.init.ones_(module.weight)   # RMSNorm weight initialized to 1
+            nn.init.ones_(module.weight)
 
     def num_params(self) -> int:
         n = sum(p.numel() for p in self.parameters())
-        n -= self.transformer.wpe.weight.numel()  # nanoGPT convention: exclude pos emb
+        n -= self.transformer.wpe.weight.numel()
         return n
 
     def forward(self, idx, targets=None):
@@ -195,20 +166,68 @@ class GPT(nn.Module):
             )
         return logits, loss
 
-    def configure_optimizer(self, weight_decay, lr, betas):
-        decay, no_decay = [], []
-        for _, p in self.named_parameters():
+    def configure_optimizers(self, weight_decay, lr, betas, muon_lr, muon_momentum=0.95):
+        """Muon for 2D weights inside transformer blocks; AdamW for embeddings and 1D params."""
+        muon_params, emb_params, no_decay = [], [], []
+        for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.dim() >= 2:
-                decay.append(p)
+            if p.dim() == 2 and name.startswith("transformer.h."):
+                muon_params.append(p)
+            elif p.dim() >= 2:
+                emb_params.append(p)
             else:
                 no_decay.append(p)
-        groups = [ 
-            {"params": decay, "weight_decay": weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
+        groups = [
+            {"params": emb_params, "weight_decay": weight_decay, "lr_mult": 1.0},
+            {"params": no_decay, "weight_decay": 0.0, "lr_mult": 1.0},
         ]
-        return torch.optim.AdamW(groups, lr=lr, betas=betas)
+        adamw = torch.optim.AdamW(groups, lr=lr, betas=betas)
+        muon = Muon(muon_params, lr=muon_lr, momentum=muon_momentum, ns_steps=5)
+        for g in muon.param_groups:
+            g["lr_mult"] = muon_lr / lr
+        return [adamw, muon]
+
+
+def zeropower_ns(G, steps=5):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.to(torch.bfloat16)
+    transposed = X.size(0) > X.size(1)
+    if transposed:
+        X = X.T
+    X = X / (X.norm() + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X
+
+
+class Muon(torch.optim.Optimizer):
+    """Nesterov momentum + Newton-Schulz orthogonalized updates, no weight decay."""
+    def __init__(self, params, lr=0.02, momentum=0.95, ns_steps=5):
+        super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            m = group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "buf" not in state:
+                    state["buf"] = torch.zeros_like(g)
+                buf = state["buf"]
+                buf.mul_(m).add_(g)
+                g = g.add(buf, alpha=m)
+                o = zeropower_ns(g, group["ns_steps"])
+                o = o * max(1.0, p.size(0) / p.size(1)) ** 0.5
+                p.add_(o.to(p.dtype), alpha=-lr)
 
 
 # --------------------------------------------------------------------------
@@ -271,7 +290,6 @@ def train(args):
         mlp_hidden=mlp_hidden,
     )
 
-    # ensure data is present (idempotent; smoke uses the synth path)
     prepare.prepare(smoke=smoke)
 
     model = GPT(cfg).to(device)
@@ -288,9 +306,10 @@ def train(args):
         run_model = model
 
     max_lr = 1.2e-3
-    optimizer = model.configure_optimizer(weight_decay=0.1, lr=max_lr, betas=(0.9, 0.95))
+    optimizers = model.configure_optimizers(
+        weight_decay=0.1, lr=max_lr, betas=(0.9, 0.95), muon_lr=0.02, muon_momentum=0.95
+    )
     warmup_steps = 100
-    # rough estimate for cosine schedule length; recomputed as we learn tok/s
     total_steps_estimate = 4100
 
     if device == "cuda":
@@ -301,7 +320,8 @@ def train(args):
     with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
         _, loss = run_model(x, y)
     loss.backward()
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers:
+        opt.zero_grad(set_to_none=True)
     if device == "cuda":
         torch.cuda.synchronize()
 
@@ -317,17 +337,20 @@ def train(args):
             break
 
         lr = lr_at_step(step, warmup_steps, total_steps_estimate, max_lr)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = lr * g.get("lr_mult", 1.0)
 
         x, y = prepare.get_batch("train", batch_size, seq_len, device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             _, loss = run_model(x, y)
 
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
 
         step += 1
         tokens_seen += batch_size * seq_len
