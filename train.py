@@ -13,6 +13,7 @@ import os
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -264,6 +265,7 @@ def get_device():
 def train(args):
     device = get_device()
     torch.manual_seed(1337)
+    np.random.seed(1337)
 
     smoke = args.smoke
     if smoke:

@@ -30,3 +30,25 @@ answered, with a link to the findings page that answered them.
    fast or too slow relative to the real number of steps taken, which would
    confound any conclusion about whether the *architecture* change helped
    versus the *schedule* mismatch happening to help or hurt.
+
+## Surfaced during review
+
+4. **Why did `control 118` (`fc-01M8783MB8JBMKACKJ04DZ167N`) suffer a +0.1174 bpb
+   anomaly on identical `train.py`?** On the unchanged epoch-102 champion
+   (`train_sha256` `6953b96825e199add5ea6a6c77c2302b0d9cc8ef988d9eff658897858902557e`),
+   `control 118` recorded `val_bpb=0.7944` with `train_wall_seconds=356.1` vs
+   `0.6743` (confirm 102, `334.3s`), `0.6745` (control 108, `334.5s`),
+   `0.6804` (control 129, `340.8s`), and `0.6797` (epoch 102 first run).
+   The `+0.1174` bpb spike and `+21s` wall time match a transient hardware
+   slowdown or silent `torch.compile` fallback to eager execution, not
+   natural run-to-run variance. Because leaving `control 118` marked `ok`
+   inflated the e102 group spread and pushed `margin_bpb` up to `0.0155`
+   (blocking clean single-run improvements such as e138 at `0.6639` and e105
+   RoPE at `0.6655`), it has been quarantined to `status=outlier` in
+   `lab-repeats.tsv`.
+   - *Open question:* Should control runs record whether `torch.compile`
+     actually ran (and `train_steps`), and what caused the ~21s slowdown on
+     Modal A10G?
+   - *Operator note:* Production Postgres `research_repeats` must also have
+     `status = 'outlier'` set for `(kind='control', epoch_number=118, call_id='fc-01M8783MB8JBMKACKJ04DZ167N')`
+     so `noiseFromRepeats` excludes it from live margin calculations.
