@@ -1,9 +1,9 @@
 """
-train.py -- AGENT-OWNED FILE. Baseline small byte-level GPT with Muon for hidden 2D matrices.
+train.py -- byte-level GPT with Muon and a causal word-prefix embedding.
 
-CONTRACT: runnable as `python train.py`; prints exactly one final line
-  RESULT {"val_bpb": ..., "train_steps": ..., "train_seconds": ..., "peak_vram_mb": ..., "params_m": ..., "tokens_seen": ...}
-val_bpb comes from prepare.evaluate_bpb. Runs on CPU too (--smoke). torch/numpy only.
+Final stdout line:
+  RESULT {"val_bpb": ..., "train_steps": ..., "train_seconds": ...,
+          "peak_vram_mb": ..., "params_m": ..., "tokens_seen": ...}
 """
 
 import argparse
@@ -21,11 +21,6 @@ import torch.nn.functional as F
 import prepare
 
 
-# --------------------------------------------------------------------------
-# Model
-# --------------------------------------------------------------------------
-
-
 @dataclass
 class GPTConfig:
     n_layer: int = 6
@@ -35,7 +30,7 @@ class GPTConfig:
     dropout: float = 0.0
     vocab_size: int = 256
     bias: bool = False
-    mlp_hidden: int = 1024  # SwiGLU hidden dim (parameter-matched to 4x GELU)
+    mlp_hidden: int = 1024
 
 
 class RMSNorm(nn.Module):
@@ -57,7 +52,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
         self.dropout = cfg.dropout
-
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_dropout_p = cfg.dropout
@@ -69,21 +63,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
+            q, k, v, attn_mask=None,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
             is_causal=True,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return self.resid_dropout(self.c_proj(y))
 
 
 class MLP(nn.Module):
@@ -114,6 +102,30 @@ class Block(nn.Module):
         return x
 
 
+def word_prefix_keys(idx):
+    """Hash the last <=12 letters of the current word, using only idx[:, :t+1].
+
+    For chronological folded bytes c0,...,cn, the hash is
+    (...((c0 * 31 + c1) * 31 + c2)... + cn) mod 16381.
+    A non-letter terminates the backward scan. Sequence starts are boundaries.
+    """
+    T = idx.size(1)
+    folded = torch.where((idx >= 65) & (idx <= 90), idx + 32, idx)
+    letters = (folded >= 97) & (folded <= 122)
+    alive = letters
+    keys = torch.zeros_like(idx)
+    power = 1
+    for offset in range(min(12, T)):
+        if offset == 0:
+            previous = folded
+        else:
+            previous = F.pad(folded[:, :T - offset], (offset, 0), value=0)
+        alive = alive & (previous >= 97) & (previous <= 122)
+        keys = (keys + torch.where(alive, previous, 0) * power) % 16381
+        power = (power * 31) % 16381
+    return keys, letters
+
+
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -129,11 +141,12 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
-
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+        self.wword = nn.Embedding(16381, cfg.n_embd)
+        nn.init.zeros_(self.wword.weight)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -154,15 +167,15 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.cfg.seq_len, f"sequence length {T} exceeds block size {self.cfg.seq_len}"
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        keys, letters = word_prefix_keys(idx)
+        word_emb = self.wword(keys) * letters.unsqueeze(-1)
+        x = self.transformer.drop(tok_emb + pos_emb + word_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
@@ -171,7 +184,7 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, lr, betas, muon_lr, muon_momentum=0.95):
-        """Muon for 2D weights inside transformer blocks; AdamW for embeddings and 1D params."""
+        """Muon for block matrices; AdamW for embeddings and 1D parameters."""
         muon_params, emb_params, no_decay = [], [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -191,6 +204,42 @@ class GPT(nn.Module):
         for g in muon.param_groups:
             g["lr_mult"] = muon_lr / lr
         return [adamw, muon]
+
+
+@torch.no_grad()
+def check_causality(model):
+    """Synthetic-only, eager CPU float32 audit before compilation and training."""
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(90210)
+            nn.init.normal_(model.wword.weight, mean=0.0, std=0.02)
+            T = min(32, model.cfg.seq_len)
+            random_bytes = torch.randint(0, 256, (2, T))
+            # Also exercise long letter runs, mixed case, and word boundaries.
+            letter_bytes = torch.randint(97, 123, (2, T))
+            letter_bytes[:, ::3] -= 32
+            letter_bytes[0, 16] = 32
+            for idx in (random_bytes, letter_bytes):
+                keys, mask = word_prefix_keys(idx)
+                logits, _ = model(idx)
+                for t0 in (1, 7, 13, 23, T - 1):
+                    if not 0 < t0 < T:
+                        continue
+                    changed = idx.clone()
+                    suffix = changed[:, t0:]
+                    changed[:, t0:] = (suffix + torch.randint(1, 256, suffix.shape)) % 256
+                    new_keys, new_mask = word_prefix_keys(changed)
+                    assert torch.equal(keys[:, :t0], new_keys[:, :t0]), "Noncausal hash keys"
+                    assert torch.equal(mask[:, :t0], new_mask[:, :t0]), "Noncausal letter mask"
+                    new_logits, _ = model(changed)
+                    error = (logits[:, :t0] - new_logits[:, :t0]).abs().max().item()
+                    assert error < 1e-4, f"Noncausal logits: t0={t0}, max_error={error}"
+    finally:
+        nn.init.zeros_(model.wword.weight)
+        model.train(was_training)
+    print("CAUSALITY_CHECK PASS", flush=True)
 
 
 def zeropower_ns(G, steps=5):
@@ -234,11 +283,6 @@ class Muon(torch.optim.Optimizer):
                 p.add_(o.to(p.dtype), alpha=-lr)
 
 
-# --------------------------------------------------------------------------
-# LR schedule: linear warmup then cosine decay
-# --------------------------------------------------------------------------
-
-
 def lr_at_step(step, warmup_steps, total_steps_estimate, max_lr, min_lr_ratio=0.1):
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
@@ -251,11 +295,6 @@ def lr_at_step(step, warmup_steps, total_steps_estimate, max_lr, min_lr_ratio=0.
     return min_lr + coeff * (max_lr - min_lr)
 
 
-# --------------------------------------------------------------------------
-# Training
-# --------------------------------------------------------------------------
-
-
 def get_device():
     if torch.cuda.is_available():
         return "cuda"
@@ -266,13 +305,12 @@ def train(args):
     device = get_device()
     torch.manual_seed(1337)
     np.random.seed(1337)
-
     smoke = args.smoke
     if smoke:
         n_layer, n_embd, n_head = 2, 64, 2
         seq_len = 64
         batch_size = 8
-        time_budget = 20.0
+        time_budget = min(20.0, float(os.environ.get("TIME_BUDGET_S", 20.0)))
         eval_max_batches = 4
         eval_batch_size = 8
         mlp_hidden = 128
@@ -280,29 +318,22 @@ def train(args):
         n_layer, n_embd, n_head = 6, 384, 6
         seq_len = 512
         batch_size = 64
-        time_budget = prepare.TIME_BUDGET
+        time_budget = float(os.environ.get("TIME_BUDGET_S", prepare.TIME_BUDGET))
         eval_max_batches = 200
         eval_batch_size = 32
         mlp_hidden = 1024
 
     cfg = GPTConfig(
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        seq_len=seq_len,
-        dropout=0.0,
-        vocab_size=256,
-        mlp_hidden=mlp_hidden,
+        n_layer=n_layer, n_head=n_head, n_embd=n_embd,
+        seq_len=seq_len, dropout=0.0, vocab_size=256, mlp_hidden=mlp_hidden,
     )
-
     prepare.prepare(smoke=smoke)
-
-    model = GPT(cfg).to(device)
+    model = GPT(cfg)
+    check_causality(model)
+    model = model.to(device)
     params_m = model.num_params() / 1e6
-
     use_amp = device == "cuda"
     amp_dtype = torch.bfloat16
-
     try:
         compiled_model = torch.compile(model)
         run_model = compiled_model
@@ -316,11 +347,10 @@ def train(args):
     )
     warmup_steps = 100
     total_steps_estimate = 4100
-
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
-    # --- warmup / compile step, excluded from the wall-clock budget ---
+    # Warmup / compile step, excluded from the wall-clock training budget.
     x, y = prepare.get_batch("train", batch_size, seq_len, device)
     with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
         _, loss = run_model(x, y)
@@ -335,31 +365,25 @@ def train(args):
     t_start = time.time()
     last_log_t = t_start
     last_log_tokens = 0
-
     while True:
         elapsed = time.time() - t_start
         if elapsed >= time_budget:
             break
-
         lr = lr_at_step(step, warmup_steps, total_steps_estimate, max_lr)
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = lr * g.get("lr_mult", 1.0)
-
         x, y = prepare.get_batch("train", batch_size, seq_len, device)
         with torch.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
             _, loss = run_model(x, y)
-
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:
             opt.step()
-
         step += 1
         tokens_seen += batch_size * seq_len
-
         if step % 50 == 0:
             now = time.time()
             dt = now - last_log_t
@@ -374,19 +398,13 @@ def train(args):
             last_log_tokens = tokens_seen
 
     train_seconds = time.time() - t_start
-
     peak_vram_mb = 0.0
     if device == "cuda":
         peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-
     val_bpb = prepare.evaluate_bpb(
-        model,
-        batch_size=eval_batch_size,
-        max_batches=eval_max_batches,
-        seq_len=seq_len,
-        device=device,
+        model, batch_size=eval_batch_size, max_batches=eval_max_batches,
+        seq_len=seq_len, device=device,
     )
-
     result = {
         "val_bpb": float(val_bpb),
         "train_steps": int(step),
